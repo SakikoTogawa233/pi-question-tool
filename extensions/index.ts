@@ -24,6 +24,7 @@ import {
 	Key,
 	matchesKey,
 	Text,
+	type TuiMouseEvent,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
@@ -34,7 +35,7 @@ import { Type } from "typebox";
 // ===========================================================================
 
 /** Render helper shared by both tools: word-wrap a string with an ANSI prefix. */
-function makeWrappers(renderWidth: number) {
+function makeWrappers(renderWidth: number, clickRows: ReturnType<typeof createClickRows>) {
 	function addWrapped(lines: string[], text: string) {
 		lines.push(...wrapTextWithAnsi(text, renderWidth));
 	}
@@ -50,7 +51,38 @@ function makeWrappers(renderWidth: number) {
 			lines.push(`${i === 0 ? prefix : continuationPrefix}${wrapped[i]}`);
 		}
 	}
-	return { addWrapped, addWrappedWithPrefix };
+	function addOption(lines: string[], prefix: string, label: string, description: string | undefined, onClick: () => void) {
+		const startRow = lines.length;
+		addWrappedWithPrefix(lines, prefix, label);
+		if (description) addWrappedWithPrefix(lines, "     ", description);
+		clickRows.addRows(startRow, lines.length, onClick);
+	}
+	return { addWrapped, addWrappedWithPrefix, addOption };
+}
+
+function createClickRows() {
+	const actions = new Map<number, { startColumn: number; endColumn: number; action: () => void }[]>();
+	function addColumnRange(row: number, startColumn: number, endColumn: number, action: () => void) {
+		const ranges = actions.get(row) ?? [];
+		ranges.push({ startColumn, endColumn, action });
+		actions.set(row, ranges);
+	}
+	return {
+		addColumnRange,
+		clear: () => actions.clear(),
+		addRows(startRow: number, endRow: number, action: () => void) {
+			for (let row = startRow; row < endRow; row++) addColumnRange(row, 0, Infinity, action);
+		},
+		handleMouse(event: TuiMouseEvent) {
+			if (event.button !== "left" || event.x < 0 || event.x >= event.width) return undefined;
+			const target = actions.get(event.y)?.find((range) => event.x >= range.startColumn && event.x < range.endColumn);
+			if (!target) return undefined;
+			if (event.type === "press") return { handled: true, focus: true };
+			if (event.type !== "click") return undefined;
+			target.action();
+			return { handled: true, render: true };
+		},
+	};
 }
 
 // ===========================================================================
@@ -193,6 +225,8 @@ export default function (pi: ExtensionAPI) {
 					let optionIndex = 0;
 					let editMode = false;
 					let cachedLines: string[] | undefined;
+					let cachedWidth: number | undefined;
+					const clickRows = createClickRows();
 
 					const editorTheme: EditorTheme = {
 						borderColor: (s) => theme.fg("accent", s),
@@ -219,7 +253,23 @@ export default function (pi: ExtensionAPI) {
 
 					function refresh() {
 						cachedLines = undefined;
+						clickRows.clear();
 						tui.requestRender();
+					}
+
+					function selectOption(index: number) {
+						const selected = allOptions[index];
+						if (!selected) return;
+						optionIndex = index;
+						if (selected.isOther) {
+							if (editMode) return;
+							editMode = true;
+							refresh();
+						} else {
+							editMode = false;
+							editor.setText("");
+							done({ answer: selected.label, wasCustom: false, index: index + 1 });
+						}
 					}
 
 					function handleInput(data: string) {
@@ -247,13 +297,7 @@ export default function (pi: ExtensionAPI) {
 						}
 
 						if (matchesKey(data, Key.enter)) {
-							const selected = allOptions[optionIndex];
-							if (selected.isOther) {
-								editMode = true;
-								refresh();
-							} else {
-								done({ answer: selected.label, wasCustom: false, index: optionIndex + 1 });
-							}
+							selectOption(optionIndex);
 							return;
 						}
 
@@ -263,11 +307,13 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					function render(width: number): string[] {
-						if (cachedLines) return cachedLines;
+						if (cachedLines && cachedWidth === width) return cachedLines;
+						cachedWidth = width;
+						clickRows.clear();
 
 						const lines: string[] = [];
 						const renderWidth = Math.max(1, width);
-						const { addWrapped, addWrappedWithPrefix } = makeWrappers(renderWidth);
+						const { addWrapped, addWrappedWithPrefix, addOption } = makeWrappers(renderWidth, clickRows);
 
 						lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 						addWrappedWithPrefix(lines, " ", theme.fg("text", params.question));
@@ -281,12 +327,11 @@ export default function (pi: ExtensionAPI) {
 							const label = `${i + 1}. ${opt.label}${isOther && editMode ? " ✎" : ""}`;
 							const color = selected || (isOther && editMode) ? "accent" : "text";
 
-							addWrappedWithPrefix(lines, prefix, theme.fg(color, label));
-
-							// Show description if present
-							if (opt.description) {
-								addWrappedWithPrefix(lines, "     ", theme.fg("muted", opt.description));
-							}
+							addOption(
+								lines, prefix, theme.fg(color, label),
+								opt.description ? theme.fg("muted", opt.description) : undefined,
+								() => selectOption(i),
+							);
 						}
 
 						if (editMode) {
@@ -299,9 +344,9 @@ export default function (pi: ExtensionAPI) {
 
 						lines.push("");
 						if (editMode) {
-							addWrappedWithPrefix(lines, " ", theme.fg("dim", "Enter to submit • Esc to go back"));
+							addWrappedWithPrefix(lines, " ", theme.fg("dim", "Enter to submit • Click an option to switch • Esc to go back"));
 						} else {
-							addWrappedWithPrefix(lines, " ", theme.fg("dim", "↑↓ navigate • Enter to select • Esc to cancel"));
+							addWrappedWithPrefix(lines, " ", theme.fg("dim", "↑↓ navigate • Enter/click to select • Esc to cancel"));
 						}
 						lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 
@@ -313,8 +358,10 @@ export default function (pi: ExtensionAPI) {
 						render,
 						invalidate: () => {
 							cachedLines = undefined;
+							clickRows.clear();
 						},
 						handleInput,
+						handleMouse: clickRows.handleMouse,
 					};
 				},
 				)
@@ -424,6 +471,8 @@ export default function (pi: ExtensionAPI) {
 				let inputMode = false;
 				let inputQuestionId: string | null = null;
 				let cachedLines: string[] | undefined;
+				let cachedWidth: number | undefined;
+				const clickRows = createClickRows();
 				const answers = new Map<string, Answer>();
 
 				// Editor for "Type something" option
@@ -442,6 +491,7 @@ export default function (pi: ExtensionAPI) {
 				// Helpers
 				function refresh() {
 					cachedLines = undefined;
+					clickRows.clear();
 					tui.requestRender();
 				}
 
@@ -496,6 +546,39 @@ export default function (pi: ExtensionAPI) {
 					advanceAfterAnswer();
 				};
 
+				function selectOption(index: number) {
+					const q = currentQuestion();
+					const opt = currentOptions()[index];
+					if (!q || !opt) return;
+					optionIndex = index;
+					if (opt.isOther) {
+						if (inputMode) return;
+						inputMode = true;
+						inputQuestionId = q.id;
+						editor.setText("");
+						refresh();
+						return;
+					}
+					inputMode = false;
+					inputQuestionId = null;
+					editor.setText("");
+					saveAnswer(q.id, opt.value, opt.label, false, index + 1);
+					advanceAfterAnswer();
+				}
+
+				function activateTab(index: number) {
+					if (index === currentTab) {
+						if (index === questions.length && allAnswered()) submit(false);
+						return;
+					}
+					inputMode = false;
+					inputQuestionId = null;
+					editor.setText("");
+					currentTab = index;
+					optionIndex = 0;
+					refresh();
+				}
+
 				function handleInput(data: string) {
 					// Input mode: route to editor
 					if (inputMode) {
@@ -517,15 +600,11 @@ export default function (pi: ExtensionAPI) {
 					// Tab navigation (multi-question only)
 					if (isMulti) {
 						if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) {
-							currentTab = (currentTab + 1) % totalTabs;
-							optionIndex = 0;
-							refresh();
+							activateTab((currentTab + 1) % totalTabs);
 							return;
 						}
 						if (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left)) {
-							currentTab = (currentTab - 1 + totalTabs) % totalTabs;
-							optionIndex = 0;
-							refresh();
+							activateTab((currentTab - 1 + totalTabs) % totalTabs);
 							return;
 						}
 					}
@@ -554,16 +633,7 @@ export default function (pi: ExtensionAPI) {
 
 					// Select option
 					if (matchesKey(data, Key.enter) && q) {
-						const opt = opts[optionIndex];
-						if (opt.isOther) {
-							inputMode = true;
-							inputQuestionId = q.id;
-							editor.setText("");
-							refresh();
-							return;
-						}
-						saveAnswer(q.id, opt.value, opt.label, false, optionIndex + 1);
-						advanceAfterAnswer();
+						selectOption(optionIndex);
 						return;
 					}
 
@@ -574,19 +644,38 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				function render(width: number): string[] {
-					if (cachedLines) return cachedLines;
+					if (cachedLines && cachedWidth === width) return cachedLines;
+					cachedWidth = width;
+					clickRows.clear();
 
 					const lines: string[] = [];
 					const renderWidth = Math.max(1, width);
 					const q = currentQuestion();
 					const opts = currentOptions();
-					const { addWrapped, addWrappedWithPrefix } = makeWrappers(renderWidth);
+					const { addWrapped, addWrappedWithPrefix, addOption } = makeWrappers(renderWidth, clickRows);
 
 					lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 
 					// Tab bar (multi-question only)
 					if (isMulti) {
-						const tabs: string[] = ["← "];
+						const prefix = renderWidth > 1 ? " " : "";
+						const tabWidth = renderWidth - prefix.length;
+						lines.push(prefix);
+						function addTab(text: string, onClick?: () => void) {
+							for (const [index, fragment] of wrapTextWithAnsi(text, tabWidth).entries()) {
+								let row = lines.length - 1;
+								let start = visibleWidth(lines[row]);
+								const length = visibleWidth(fragment);
+								if (index > 0 || start + length > renderWidth) {
+									lines.push(prefix);
+									row++;
+									start = prefix.length;
+								}
+								lines[row] += fragment;
+								if (onClick) clickRows.addColumnRange(row, start, start + length, onClick);
+							}
+						}
+						addTab("← ");
 						for (let i = 0; i < questions.length; i++) {
 							const isActive = i === currentTab;
 							const isAnswered = answers.has(questions[i].id);
@@ -595,7 +684,8 @@ export default function (pi: ExtensionAPI) {
 							const color = isAnswered ? "success" : "muted";
 							const text = ` ${box} ${lbl} `;
 							const styled = isActive ? theme.bg("selectedBg", theme.fg("text", text)) : theme.fg(color, text);
-							tabs.push(`${styled} `);
+							addTab(styled, () => activateTab(i));
+							addTab(" ");
 						}
 						const canSubmit = allAnswered();
 						const isSubmitTab = currentTab === questions.length;
@@ -603,8 +693,8 @@ export default function (pi: ExtensionAPI) {
 						const submitStyled = isSubmitTab
 							? theme.bg("selectedBg", theme.fg("text", submitText))
 							: theme.fg(canSubmit ? "success" : "dim", submitText);
-						tabs.push(`${submitStyled} →`);
-						addWrappedWithPrefix(lines, " ", tabs.join(""));
+						addTab(submitStyled, () => activateTab(questions.length));
+						addTab(" →");
 						lines.push("");
 					}
 
@@ -618,10 +708,11 @@ export default function (pi: ExtensionAPI) {
 							const label = `${i + 1}. ${opt.label}${isOther && inputMode ? " ✎" : ""}`;
 							const color = selected || (isOther && inputMode) ? "accent" : "text";
 
-							addWrappedWithPrefix(lines, prefix, theme.fg(color, label));
-							if (opt.description) {
-								addWrappedWithPrefix(lines, "     ", theme.fg("muted", opt.description));
-							}
+							addOption(
+								lines, prefix, theme.fg(color, label),
+								opt.description ? theme.fg("muted", opt.description) : undefined,
+								() => selectOption(i),
+							);
 						}
 					}
 
@@ -629,7 +720,7 @@ export default function (pi: ExtensionAPI) {
 					if (inputMode && q) {
 						addWrappedWithPrefix(lines, " ", theme.fg("text", q.prompt));
 						lines.push("");
-						// Show options for reference
+						// Keep options available while editing
 						renderOptions();
 						lines.push("");
 						addWrappedWithPrefix(lines, " ", theme.fg("muted", "Your answer:"));
@@ -637,7 +728,7 @@ export default function (pi: ExtensionAPI) {
 							lines.push(` ${line}`);
 						}
 						lines.push("");
-						addWrappedWithPrefix(lines, " ", theme.fg("dim", "Enter to submit • Esc to cancel"));
+						addWrappedWithPrefix(lines, " ", theme.fg("dim", "Enter to submit • Click an option to switch • Esc to cancel"));
 					} else if (currentTab === questions.length) {
 						addWrappedWithPrefix(lines, " ", theme.fg("accent", theme.bold("Ready to submit")));
 						lines.push("");
@@ -650,14 +741,21 @@ export default function (pi: ExtensionAPI) {
 							}
 						}
 						lines.push("");
-						if (allAnswered()) {
-							addWrappedWithPrefix(lines, " ", theme.fg("success", "Press Enter to submit"));
-						} else {
+						const canSubmit = allAnswered();
+						if (!canSubmit) {
 							const missing = questions
 								.filter((q) => !answers.has(q.id))
 								.map((q) => q.label)
 								.join(", ");
 							addWrappedWithPrefix(lines, " ", theme.fg("warning", `Unanswered: ${missing}`));
+							lines.push("");
+						}
+						const startRow = lines.length;
+						addWrappedWithPrefix(lines, " ", theme.fg(canSubmit ? "success" : "dim", "Press Enter or click here to submit"));
+						if (canSubmit) {
+							clickRows.addRows(startRow, lines.length, () => {
+								if (allAnswered()) submit(false);
+							});
 						}
 					} else if (q) {
 						addWrappedWithPrefix(lines, " ", theme.fg("text", q.prompt));
@@ -668,8 +766,8 @@ export default function (pi: ExtensionAPI) {
 					lines.push("");
 					if (!inputMode) {
 						const help = isMulti
-							? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel"
-							: "↑↓ navigate • Enter select • Esc cancel";
+							? "Tab/←→/click navigate • ↑↓ select • Enter/click confirm • Esc cancel"
+							: "↑↓ navigate • Enter/click select • Esc cancel";
 						addWrappedWithPrefix(lines, " ", theme.fg("dim", help));
 					}
 					lines.push(theme.fg("accent", "─".repeat(renderWidth)));
@@ -682,8 +780,10 @@ export default function (pi: ExtensionAPI) {
 					render,
 					invalidate: () => {
 						cachedLines = undefined;
+						clickRows.clear();
 					},
 					handleInput,
+					handleMouse: clickRows.handleMouse,
 				};
 				})
 				.finally(() => ctx.ui.setWorkingVisible(true));

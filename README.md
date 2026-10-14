@@ -16,6 +16,8 @@ Adds two tools the model can call when it needs structured input from you:
 Each tool renders a full-screen custom TUI. Answers are returned to the model
 as tool results, so the agent can act on your choices.
 
+In Pi's fullscreen terminal mode (Pi 1.2+), click an option's label or description to select it, including `Type something.`. While typing, click another option to discard the draft and select that answer. Click `Press Enter or click here to submit` to send a completed questionnaire. Keyboard controls work in both fullscreen and regular mode; regular mode leaves the mouse to the terminal for scrollback. Question tabs are clickable too. Click Submit to open the summary, then click it again to submit once every question is answered. The submit hint stays visible but dimmed while questions are unanswered. Text entry still uses the keyboard.
+
 The implementation is adapted from the official pi extension examples
 ([`question.ts`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/examples/extensions/question.ts)
 and
